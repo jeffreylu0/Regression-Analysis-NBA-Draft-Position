@@ -1,0 +1,168 @@
+---
+title: "NBA Draft Position, Regression Analysis"
+output:
+  pdf_document: default
+  html_document: default
+---
+## Introduction
+```{r, include = FALSE}
+library(tidyverse)
+library(broom)
+library(MASS)
+library(leaps)
+library(car)
+library(knitr)
+nba <- read.csv('all_seasons.csv')
+knitr::opts_chunk$set(comment = NA)
+opts_chunk$set(tidy = FALSE)
+```
+
+The dataset used for this project includes the biometric, biographic, and basic box score features for every NBA player from the 1996 to 2016 seasons. The primary goal of this project is to use players’ biometric information (height and weight) as well as career box score averages as potential predictors for their initial draft position. Therefore, biographic information from the dataset will be omitted and career averages for every unique player will replace the season-by-season statistics. Additionally, the draft year of a player will be limited to 1996 and onwards to control for the careers of players that were drafted before the scope of the dataset. The original dataset can be found [here](https://www.kaggle.com/justinas/nba-players-data).
+
+Using an OLS model, we attempt to shed light on two questions of interest:  
+  
+* **Which features are the most significantly related to draft position?**  
+* **Which box score statistics can we expect future players to contribute as they are drafted higher or lower?**  
+
+## Initial Filtering/Manipulation
+Players whose careers started before 1996 will not be included in this analysis simply because we don't the data for their full careers. Therefore, only players who were drafted 1996 and onward will be included.
+```{r}
+# Drop undrafted players
+# Convert draft number and draft year into numeric
+# Filter for draft years 1996 and above
+nba <- 
+  nba %>% 
+  filter(draft_number != 'Undrafted', draft_year != 'Undrafted') %>%    
+  mutate(draft_number = as.numeric(as.character(draft_number)), draft_year = as.numeric(as.character(draft_year))) %>%  
+  filter(draft_year >= 1996)
+```
+Instead of season-by-season statistics, we are interested in how the player performs over the course of their entire career and how that informs where they are intially drafted. Therefore, we restructure the dataset to consist of career averages for each unique player drafted between 1996 and 2016.
+```{r}
+# Extract career statistics' averages from each player
+career.avg <- function(df){
+  avg.data <- data.frame()
+  players <- unique(df$player_name)
+  for(i in 1:length(players)){
+    new <- df %>% filter(player_name == players[i]) %>% select_if(is.numeric)
+    new.avg <- mutate_all(new, mean)[1,]
+    avg.data <- rbind(avg.data, new.avg)
+  }
+  return(avg.data)
+}
+
+nba.avg <- career.avg(nba)
+nba.avg <- subset(nba.avg, select = -c(X, draft_year, age)) #Remove non-playing variables
+```
+
+
+## Model Selection
+### Best Subsets vs. Stepwise Regression
+In selecting the best subset of variables, Mallow's Cp is used to evaluate the potential models.
+```{r}
+#Best Subsets using Cp
+models <- regsubsets(draft_number ~ ., data = nba.avg, nvmax = 12)
+sum.mod <- summary(models)
+plot(sum.mod$cp, xlab='Number of Predictors', ylab='Cp') #using 7 predictors for less complexity
+abline(1,1)
+```
+
+The subset models that have Cp values close to their respective number of variables are seen as the potential models. To reduce complexity in this case, the 7-predictor model `model.cp` is chosen. All subset models are shown in the table below.  
+```{r}
+subsets <- sum.mod$which  #subset of best models
+model.cp <- lm(draft_number ~ player_height + gp + pts + reb + ast + oreb_pct + usg_pct, data = nba.avg)
+```
+
+Next, two stepwise models are created using both AIC and BIC as criteria.
+```{r}
+#Stepwise selection using AIC and BIC
+model0 <- lm(draft_number ~ 1, data = nba.avg)
+model.all <- lm(draft_number ~ ., data = nba.avg)
+n <- nrow(nba.avg)
+step.AIC <- step(model.all, scope = list(lower = model0, upper = model.all), trace=0)
+step.BIC <- step(model.all, scope = list(lower = model0, upper = model.all), k = log(n), trace=0) 
+```
+
+Using a general linear F-test, we determine that the AIC model is more informative than the BIC model. We then compare the AIC model with the Cp model and conclude that the Cp model is the most informative out of the three. 
+```{r}
+# Comparison of AIC and BIC models
+model.AIC <- lm(formula(step.AIC), data = nba.avg)
+model.BIC <- lm(formula(step.BIC), data = nba.avg)
+anova(model.BIC, model.AIC) #Reject model.BIC
+
+#Compare best subsets Cp model (7 predictors) with model.AIC (8 predictors)
+anova(model.cp, model.AIC) #Reject model.AIC
+```
+
+## Residual Analysis & Transformation
+```{r}
+plot(model.cp, which = c(1,2)) 
+```
+
+Looking at the residual plots, we can see some heteroscedasticity and non-normality. To fix these violations, a Box-Cox transformation is done on the response. 
+```{r}
+#Boxcox Transformation on Response
+bc <- boxcox(model.cp, plotit = F)
+lambda <- bc$x[which.max(bc$y)]  
+model.cp.bc<- lm(sqrt(draft_number) ~ player_height + gp + pts + reb + ast + oreb_pct + usg_pct, data = nba.avg)
+plot(model.cp.bc, which = c(1,2))
+shapiro.test(model.cp.bc$residuals)
+```
+Since lambda from the transformation is approximately 0.5, draft number is square root transformed. The heteroscedasticity is reduced and the Shapiro-Wilk test for normality is passed.
+
+## Interactions, Multicollinearity, & Influential Points
+Below we check for possible interactions in the transformed Cp model. Specifically, we are interested in interactions between the on-court variables that most effectively evaluate a player's contribution to games and skill: usage percentage, games played, points, assists, and rebounds. 
+```{r}
+#Check usage percentage interactions
+add1(model.cp.bc, ~ . + usg_pct:pts + usg_pct:reb + usg_pct:ast, test = 'F')
+
+#Check games played interactions
+add1(model.cp.bc, ~ . + gp:pts + gp:ast + gp:reb + gp:usg_pct, test = 'F')
+
+#Check pts,ast, and reb interactions
+add1(model.cp.bc, ~ . + pts:reb + pts:ast + reb:ast, test = 'F')
+```
+
+An interaction between games played and rebounds per game was found to be significant so it is incorporated into the model. However, when using variance inflation factors (VIF) to check for multicollinearity in the updated model, we find very high VIF values for rebounds and the new interaction term. As a result, we decide not to add the interaction between rebounds and games played.
+```{r}
+model.cp.int <- update(model.cp.bc, ~ . + gp:reb)
+vif(model.cp.int)
+```
+
+According to Cook's distance, we remove one influential point and run our final model. 
+```{r}
+#Removing influential points
+plot(model.cp.bc, which = 4)
+model.cp.final <- lm(formula(model.cp.bc), data = nba.avg[-487,])
+```
+
+## Analysis and Interpretation
+
+For our first question of interest, we will observe the final model’s t-test p-values for each feature since they indicate the significance of the relationship with **draft_number**. Features with the lowest p-values can be assumed to have the strongest relationships with the response. For our second question, the sign and magnitude of the model coefficients will help us conduct inference on how the features will change for future draft picks as draft position increases or decreases. Draft position decreases (being drafted higher) as features with negative coefficients increase. In other words, we can expect that as future players are drafted higher, they will more likely produce negative features. 
+
+```{r}
+summary(model.cp.final)
+```
+
+##### **Which features are the most related to draft position?**
+
+According to the p-values, the three most significant predictors in the model are player_height, gp (games played), and reb (rebounds). Because basketball is a sport that favors taller players, it is sensible that height has the strongest relationship with draft position. This fact may correspond to the significance of rebounds, a statistic that is generally high among taller players. The number of games played in a season is also not surprising given that players who are drafted higher overall are on average more talented and will consequently be allowed to play more games than those drafted later.
+
+##### **Which box score statistics can we project future players to contribute as they are drafted higher or lower?**
+
+As mentioned before, negative estimates correspond to features that we can expect to increase as players are drafted higher. On the other hand, positive estimates correspond to features that are more consistent at lower draft positions. We will consider several features.
+
+The largest of these negative estimates is usage percentage (**usg_pct**), meaning that top draft picks will see higher usage. Stemming from the same intuition for the significance of games played, top picks are considered more talented and will likely have higher usage or more percentage of possessions with the ball in their hands. 
+
+Next, looking at the core box score statistics of points, rebounds, and assists, we can see that they are also all negative. Interestingly, points has the smallest estimate of the three while rebound has the largest, showing that rebounds and assists have a sharper increase or decrease than points as we move up or down the draft. The general interpretation here is that pure scorers (players who contribute to points only) are more likely to be found across the entire draft while better rebounders and passers are more prevalent at the top of the draft and fall off significantly from there. 
+
+Offensive rebound percentage(**oreb_pct**) is the highest magnitude estimate but is also positive. An offensive rebound is defined as a rebound that a player grabs while their team is on an offensive possession. Because top draft picks see higher usage percentages, they are expected to be the primary initiator of offense most of the time and this leaves other players on the team, particularly role players, to grab offensive rebounds. Since talented players are taken at the top of the draft, we can say that role players are generally taken lower in the draft. This may explain the reasoning behind a particularly large positive estimate for offensive rebound percentage.
+
+## Conclusion
+
+The final model constructed helped to confirm intuition about the projection of biometric and box score features on draft position as well as offer insights into how those features are expected to change. However, this analysis is not exhaustive; the interpretations of the model estimates and the answers to our questions of interest can be confounded by effects outside the scope of this project. The data is limited to the 1996 - 2016 seasons, in which a large part was considered an era of defensive-style basketball. Consequently, the model is less generalizable to the current state of the game because it does not capture the full careers of recent players in addition to the emergence of focus on offensive play from those players. Some potential future work include gathering more data and extending the scope of the analysis, including biographic information such as age which can be highly predictive in sports, running other model diagnostics, or even trying other regression methods. 
+
+
+
+
+
+
